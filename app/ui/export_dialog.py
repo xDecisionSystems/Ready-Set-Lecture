@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -52,6 +53,16 @@ class ExportDialog(QDialog):
         layout.addWidget(self.fast_radio)
         layout.addWidget(self.precise_radio)
 
+        self.gpu_checkbox = QCheckBox("Encode on the graphics chip when possible")
+        self.gpu_checkbox.setChecked(app_settings.get_gpu_encoding())
+        self.gpu_checkbox.setToolTip(
+            "Re-encode on the computer's graphics chip (NVIDIA, Intel, AMD or Apple) instead of the processor: much faster and lighter on the "
+            "processor, and the files can be a little larger. If the chip can't do it, the processor is used anyway."
+        )
+        self.gpu_checkbox.setEnabled(False)  # only a precise cut re-encodes; a fast one copies the stream
+        self.precise_radio.toggled.connect(self.gpu_checkbox.setEnabled)
+        layout.addWidget(self.gpu_checkbox)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -67,6 +78,7 @@ class ExportDialog(QDialog):
     def export_settings(self) -> ExportSettings:
         output_dir = Path(self.folder_edit.text())
         app_settings.set_output_dir(output_dir)
+        app_settings.set_gpu_encoding(self.gpu_checkbox.isChecked())  # read by the export when it starts, on its own thread
 
         base_name = self.name_edit.text().strip()
         for invalid_char in '<>:"/\\|?*':

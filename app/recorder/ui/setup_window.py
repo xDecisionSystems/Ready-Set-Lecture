@@ -11,13 +11,13 @@ from PySide6.QtCore import QPoint, QRect, QRegularExpression, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QRegularExpressionValidator
 from PySide6.QtMultimedia import QMediaDevices
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
 from app.core import settings as app_settings
 from app.core.ffmpeg_utils import probe_duration, unique_path
-from app.core.video_encoder import prefetch_encoders
+from app.core.video_encoder import describe_encoder, prefetch_encoders
 from app.recorder.core.audio_meter import AudioLevelMeter
 from app.recorder.core.clicker import ACTION_MARK, ACTION_PAUSE, ClickerConfig
 from app.recorder.core.devices import (
@@ -139,6 +139,13 @@ class RecorderMainWindow(QMainWindow):
         form.addRow("Mic test", self.mic_test)
         form.addRow("Save to", save_row)
         form.addRow("File name", name_row)
+        self.gpu_checkbox = QCheckBox("Encode on the graphics chip when possible")
+        self.gpu_checkbox.setChecked(app_settings.get_gpu_encoding())
+        self.gpu_checkbox.setToolTip(
+            "Compress the video on the computer's graphics chip (NVIDIA, Intel, AMD or Apple) instead of the processor. That leaves the processor "
+            "free and helps avoid dropped frames; the files can be a little larger. If the chip can't do it, the processor is used anyway. "
+            "Turn this off to always use the processor.")
+        form.addRow("Video encoding", self.gpu_checkbox)
         self.clicker_button = QPushButton("Setup BT Clicker")
         self.clicker_button.setToolTip("Use a Bluetooth clicker to pause/resume and to mark while you record.")
         self.clicker_label = QLabel()
@@ -176,6 +183,7 @@ class RecorderMainWindow(QMainWindow):
         self._controller.preview_image.connect(self._preview_frame)
         self._controller.state_changed.connect(self._preview_state)
         self._controller.state_changed.connect(self._state_changed_for_tint)
+        self.gpu_checkbox.toggled.connect(app_settings.set_gpu_encoding)
         self.clicker_button.clicked.connect(self._setup_clicker)
         self._clicker.action_triggered.connect(self._clicker_action)
         self.camera_format_combo.currentIndexChanged.connect(self._camera_format_changed)
@@ -725,6 +733,11 @@ class RecorderMainWindow(QMainWindow):
         how = describe_recording(self._pending_config.source) if self._pending_config is not None else ""
         if how:
             note += f"\n\n{how}"
+        source = self._pending_config.source if self._pending_config is not None else None
+        if source is not None and not getattr(source, "saves_stream_as_is", False):  # a camera's own stream is only saved, not encoded
+            encoder = describe_encoder(allow_filters=False)
+            if encoder:
+                note += f"\n\nVideo encoded by {encoder}."
         if self._controller.dropped_frame_warnings:
             note += ("\n\nSome frames were dropped: the camera's picture arrived faster than it could be processed. "
                      "A lower camera resolution, or closing other programs, would help.")

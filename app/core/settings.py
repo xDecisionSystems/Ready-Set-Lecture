@@ -26,6 +26,7 @@ _KEY_RECORD_SHOW_PREVIEW = "record/show_camera_preview"
 _KEY_RECORD_RED_WHEN_PAUSED = "record/red_screen_when_paused"
 _KEY_RECORD_CLICKER = "record/bt_clicker"
 _KEY_RECORD_CAMERA_FORMAT = "record/camera_format"
+_KEY_USE_GPU_ENCODING = "encode/use_gpu"
 _CAMERA_FORMATS = ("auto", "h264", "hevc", "mjpeg", "raw")
 
 
@@ -181,6 +182,17 @@ def get_red_when_paused() -> bool:
 def set_red_when_paused(on: bool) -> None:
     settings = _settings()
     settings.setValue(_KEY_RECORD_RED_WHEN_PAUSED, "true" if on else "false")
+    settings.sync()
+
+
+def get_gpu_encoding() -> bool:
+    """Whether recording and precise export encode on the graphics chip when this machine has a working one (on unless turned off)."""
+    return str(_settings().value(_KEY_USE_GPU_ENCODING, "true")).lower() in ("true", "1")
+
+
+def set_gpu_encoding(on: bool) -> None:
+    settings = _settings()
+    settings.setValue(_KEY_USE_GPU_ENCODING, "true" if on else "false")
     settings.sync()
 
 

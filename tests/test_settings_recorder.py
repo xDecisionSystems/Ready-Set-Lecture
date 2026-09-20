@@ -28,6 +28,13 @@ class RecorderSettingsTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.temp.cleanup()
 
+    def test_gpu_encoding_is_on_until_it_is_switched_off_and_the_choice_is_kept(self) -> None:
+        self.assertTrue(settings.get_gpu_encoding())
+        settings.set_gpu_encoding(False)
+        self.assertFalse(settings.get_gpu_encoding())
+        settings.set_gpu_encoding(True)
+        self.assertTrue(settings.get_gpu_encoding())
+
     def test_settings_go_to_the_redirected_store_not_the_native_one(self) -> None:
         settings.set_record_gain(1.25)
         self.assertEqual(settings._settings().format(), QSettings.Format.IniFormat)

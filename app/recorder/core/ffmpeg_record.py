@@ -165,7 +165,7 @@ def build_ffmpeg_argv(config: RecordConfig, output_path: Path | None = None) -> 
         video_options = ["-c:v", "copy", *(["-tag:v", "hvc1"] if source.input_format == "hevc" else [])]
     else:
         recorded_width, recorded_height = source.capture_rect[2:] if isinstance(source, ScreenCaptureConfig) else (source.crop_rect[2:] if source.crop_rect else source.native_size)
-        video_options = h264_args("record", pixels=recorded_width * recorded_height)
+        video_options = h264_args("record", pixels=recorded_width * recorded_height, allow_filters=False)  # a camera command has a -vf or -filter_complex of its own
     cmd += [*video_options, "-video_track_timescale", str(VIDEO_TIMESCALE)]
     if audio.capture_id:
         cmd += ["-c:a", "aac"]

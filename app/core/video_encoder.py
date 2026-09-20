@@ -218,6 +218,25 @@ def _hardware_encoder(encoders: frozenset[str], allow_filters: bool = True) -> H
     return None
 
 
+def hardware_encoder(encoders: frozenset[str], allow_filters: bool = True) -> HardwareEncoder | None:
+    """The graphics-chip encoder that would be used (see _hardware_encoder), for callers outside this module."""
+    return _hardware_encoder(encoders, allow_filters)
+
+
+def is_hardware_encoder(name: str) -> bool:
+    """Whether *name* (an ffmpeg encoder name) is one of the graphics chips' encoders."""
+    return any(candidate.encoder == name for candidates in _HARDWARE_BY_PLATFORM.values() for candidate in candidates)
+
+
+def without_pixel_format(args: list[str]) -> list[str]:
+    """*args* without their -pix_fmt: for frames that are already on the chip, where asking for a format would pull them back to memory."""
+    cleaned = list(args)
+    if "-pix_fmt" in cleaned:
+        position = cleaned.index("-pix_fmt")
+        del cleaned[position:position + 2]
+    return cleaned
+
+
 def prefetch_encoders() -> None:
     """Ask in the background so the first recording doesn't wait: for ffmpeg's list of encoders, and for the test encodes that show
     whether the graphics chip works."""
@@ -251,14 +270,15 @@ def describe_encoder(allow_filters: bool = True) -> str:
     return "the CPU (x264)" if "libx264" in encoders else "the CPU (OpenH264)"
 
 
-def h264_args(purpose: str, encoders: frozenset[str] | None = None, pixels: int | None = None, *, allow_filters: bool = True) -> list[str]:
+def h264_args(purpose: str, encoders: frozenset[str] | None = None, pixels: int | None = None, *, allow_filters: bool = True,
+              gpu: bool = True) -> list[str]:
     """The ffmpeg output options that choose and configure the video encoder. *purpose* is "record" or "export"; *pixels* is the
     size of the recorded frame (width x height), which picks a lighter x264 preset for frames bigger than 1080p (and sizes the bitrate
     where an encoder has to be given one). Pass *allow_filters* False when the command has a -vf or -filter_complex of its own: an
-    encoder that must add one (VA-API) is then left out."""
+    encoder that must add one (VA-API) is then left out. Pass *gpu* False to skip the graphics chip and use the CPU."""
     if encoders is None:
         encoders = available_encoders(find_ffmpeg())
-    hardware = _hardware_encoder(encoders, allow_filters)
+    hardware = _hardware_encoder(encoders, allow_filters) if gpu else None
     if hardware is not None:
         return hardware.args(purpose, pixels)
     if "libx264" in encoders:

@@ -14,7 +14,8 @@ from PySide6.QtGui import QImage
 
 from app.core.ffmpeg_locator import find_ffmpeg
 from app.core.ffmpeg_utils import concat_segments, probe_duration
-from app.core.video_encoder import h264_args
+from app.core.video_encoder import h264_args, is_hardware_encoder
+from app.recorder.core.gpu_capture import plan_gpu_capture
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,10 @@ class ScreenCaptureConfig:
     capture_rect: tuple[int, int, int, int]
     fps: int = 30
     draw_cursor: bool = True
+    # Which screen the area is on (Windows' name for it, e.g. \\.\DISPLAY1) and that whole screen's rectangle, in the same physical desktop
+    # pixels as capture_rect. Only the graphics-chip capture needs them: it captures one display and takes the area as an offset inside it.
+    screen_name: str | None = None
+    screen_rect: tuple[int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -117,17 +122,28 @@ def _dshow_part(kind: str, capture_id: str) -> str:
     return capture_id if capture_id.startswith(f"{kind}=") else f"{kind}={capture_id}"
 
 
-def build_ffmpeg_argv(config: RecordConfig, output_path: Path | None = None) -> list[str]:
-    """Build an ffmpeg command for one self-contained MP4 recording segment."""
+def uses_graphics_chip(argv: list[str]) -> bool:
+    """Whether this ffmpeg command captures the screen on the graphics chip, or encodes on it."""
+    encoder = argv[argv.index("-c:v") + 1] if "-c:v" in argv and argv.index("-c:v") + 1 < len(argv) else ""
+    return is_hardware_encoder(encoder) or any(part.startswith("ddagrab=") for part in argv)
+
+
+def build_ffmpeg_argv(config: RecordConfig, output_path: Path | None = None, allow_gpu: bool = True) -> list[str]:
+    """Build an ffmpeg command for one self-contained MP4 recording segment. *allow_gpu* False keeps the graphics chip out of it."""
     output = output_path or config.output_path
     source, audio = config.source, config.audio
     cmd = [find_ffmpeg(), "-y"]
+    gpu = None
     if isinstance(source, ScreenCaptureConfig):
         x, y, width, height = source.capture_rect
-        cmd += ["-f", "gdigrab", "-framerate", str(source.fps)]
-        if not source.draw_cursor:
-            cmd += ["-draw_mouse", "0"]
-        cmd += ["-offset_x", str(x), "-offset_y", str(y), "-video_size", f"{width}x{height}", "-i", "desktop"]
+        gpu = plan_gpu_capture(source) if allow_gpu else None
+        if gpu is not None:
+            cmd += gpu.input_args  # the screen is read on the chip and stays there until it is encoded
+        else:
+            cmd += ["-f", "gdigrab", "-framerate", str(source.fps)]
+            if not source.draw_cursor:
+                cmd += ["-draw_mouse", "0"]
+            cmd += ["-offset_x", str(x), "-offset_y", str(y), "-video_size", f"{width}x{height}", "-i", "desktop"]
         if audio.capture_id:
             cmd += ["-f", "dshow", "-i", _dshow_part("audio", audio.capture_id), "-map", "0:v", "-map", "1:a", "-af", f"volume={audio.gain:.3f}"]
         else:
@@ -165,7 +181,11 @@ def build_ffmpeg_argv(config: RecordConfig, output_path: Path | None = None) -> 
         video_options = ["-c:v", "copy", *(["-tag:v", "hvc1"] if source.input_format == "hevc" else [])]
     else:
         recorded_width, recorded_height = source.capture_rect[2:] if isinstance(source, ScreenCaptureConfig) else (source.crop_rect[2:] if source.crop_rect else source.native_size)
-        video_options = h264_args("record", pixels=recorded_width * recorded_height, allow_filters=False)  # a camera command has a -vf or -filter_complex of its own
+        if gpu is not None:
+            cmd += ["-vf", gpu.filter]  # labels the frames with the colours the chip really made (see gpu_capture)
+            video_options = gpu.encoder_args
+        else:
+            video_options = h264_args("record", pixels=recorded_width * recorded_height, allow_filters=False, gpu=allow_gpu)  # a camera command has a -vf or -filter_complex of its own
     cmd += [*video_options, "-video_track_timescale", str(VIDEO_TIMESCALE)]
     if audio.capture_id:
         cmd += ["-c:a", "aac"]
@@ -252,6 +272,11 @@ class RecordingSession:
         self._log: BinaryIO | None = None
         self._finishing: list[tuple[subprocess.Popen[bytes], BinaryIO | None]] = []  # stopped segments still closing their files
         self.dropped_frame_warnings = 0  # set by finalize(): how often ffmpeg said the camera stream was backing up
+        self._allow_gpu = True  # false once a start-up failure has sent this recording to the CPU
+        self.segment_used_gpu = False  # the newest segment captures or encodes on the graphics chip
+        self.captured_on_gpu = False  # ... and it captures the screen there
+        self.fell_back_to_cpu = False
+        self._segment_started = 0.0
 
     def set_cursor_visible(self, visible: bool) -> bool:
         """Record the mouse cursor (or not) from the next segment on. Screen capture only; True if that changed anything."""
@@ -283,8 +308,11 @@ class RecordingSession:
         # next log write, never sees the 'q' stop, and gets terminated, leaving an MP4 with no moov atom.
         self._log = open(path.with_suffix(".log"), "wb")
         preview = self.config.source.preview_size if isinstance(self.config.source, CameraCaptureConfig) else None
-        self.proc = subprocess.Popen(build_ffmpeg_argv(self.config, path), stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE if preview else subprocess.DEVNULL, stderr=self._log)
+        argv = build_ffmpeg_argv(self.config, path, allow_gpu=self._allow_gpu)
+        self.segment_used_gpu = uses_graphics_chip(argv)
+        self.captured_on_gpu = any(part.startswith("ddagrab=") for part in argv)
+        self._segment_started = time.monotonic()
+        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE if preview else subprocess.DEVNULL, stderr=self._log)
         if preview:
             threading.Thread(target=_drain_frames, args=(self.proc.stdout, preview[0] * preview[1] * 4, self._on_preview_frame), daemon=True).start()
         self.segment_paths.append(path)
@@ -340,6 +368,29 @@ class RecordingSession:
 
     def poll_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
+
+    # A hardware encoder or a display the chip can't duplicate is refused right as ffmpeg starts. A segment that dies that soon on the chip is
+    # a start-up failure, not a lost recording, so it is safe to throw away and start again on the CPU. Any later death is a real failure: a
+    # second segment made by a different encoder can't be joined to the first, so nothing is switched over mid-recording.
+    START_UP_SECONDS = 6.0
+
+    def fall_back_to_cpu(self) -> bool:
+        """Called when ffmpeg has died. If that was a start-up failure of a graphics-chip segment (the first of this recording), forget the
+        segment, use the CPU from now on and return True: the caller then starts the segment again. Otherwise False."""
+        if (not self._allow_gpu or not self.segment_used_gpu or len(self.segment_paths) != 1
+                or time.monotonic() - self._segment_started > self.START_UP_SECONDS):
+            return False
+        self._allow_gpu = False
+        self.fell_back_to_cpu = True
+        self.segment_used_gpu = self.captured_on_gpu = False
+        self.proc = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+        path = self.segment_paths.pop()
+        path.unlink(missing_ok=True)
+        path.with_suffix(".log").unlink(missing_ok=True)
+        return True
 
     def finalize(self, output_path: Path) -> Path:
         self._reap_finishing(5.0)
@@ -414,6 +465,8 @@ class RecordingController(QObject):
         self._feed: PreviewFeed | None = None
         self.elapsed_seconds = 0.0
         self.dropped_frame_warnings = 0  # of the recording that just finished: how often the camera stream backed up
+        self.gpu_fell_back = False  # the graphics chip could not start, so this recording is on the CPU
+        self.captured_on_gpu = False  # of the recording that just finished: the screen was read on the graphics chip
         self._last_tick = 0.0
         self._state: str | None = None
         self._worker: PauseStopWorker | None = None
@@ -462,6 +515,7 @@ class RecordingController(QObject):
             self.failed.emit(str(exc))
             return
         self._final_output = final_output
+        self.gpu_fell_back = False
         self.elapsed_seconds = 0.0
         self._last_tick = time.monotonic()
         self._state = "recording"
@@ -534,6 +588,8 @@ class RecordingController(QObject):
 
     def _finish(self, output: Path) -> None:
         self.dropped_frame_warnings = self.session.dropped_frame_warnings if self.session else 0
+        self.captured_on_gpu = bool(self.session and self.session.captured_on_gpu)
+        self.gpu_fell_back = bool(self.session and self.session.fell_back_to_cpu)
         self._reset()
         self.finished.emit(output)
 
@@ -555,6 +611,15 @@ class RecordingController(QObject):
         if self._state != "recording" or not self.session:
             return
         if not self.session.poll_alive():
+            if self.session.fall_back_to_cpu():
+                try:
+                    self.session.start_segment()  # the same recording, from the start, on the CPU
+                except Exception as exc:  # noqa: BLE001
+                    self._fail(exc)
+                    return
+                self._last_tick = time.monotonic()
+                self.gpu_fell_back = True
+                return
             tail = self.session.log_tail()
             self._fail("ffmpeg stopped unexpectedly." + (f"\n\n{tail}" if tail else ""))
             return

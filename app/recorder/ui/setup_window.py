@@ -28,6 +28,7 @@ from app.recorder.core.ffmpeg_record import (
     AudioCaptureConfig, CameraCaptureConfig, RecordConfig, RecordingController, ScreenCaptureConfig, describe_recording, preview_frame_size,
 )
 from app.recorder.core.file_names import ILLEGAL_NAME_CHARACTERS, MAX_NAME_LENGTH, clean_file_name, default_recording_name
+from app.recorder.core.gpu_capture import prefetch_gpu_capture
 from app.recorder.core.marker_export import write_marker_sidecar
 from app.recorder.core.raw_input import ClickerService
 from app.recorder.ui.auto_gain_dialog import AutoGainDialog
@@ -79,6 +80,7 @@ class RecorderMainWindow(QMainWindow):
         self._populate_devices()
         self._init_save_location()
         prefetch_encoders()  # so the first recording doesn't wait for ffmpeg to list its encoders
+        prefetch_gpu_capture(self._screens)  # ... or to find out whether each screen can be captured on the graphics chip
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -139,12 +141,12 @@ class RecorderMainWindow(QMainWindow):
         form.addRow("Mic test", self.mic_test)
         form.addRow("Save to", save_row)
         form.addRow("File name", name_row)
-        self.gpu_checkbox = QCheckBox("Encode on the graphics chip when possible")
+        self.gpu_checkbox = QCheckBox("Use the graphics chip when possible")
         self.gpu_checkbox.setChecked(app_settings.get_gpu_encoding())
         self.gpu_checkbox.setToolTip(
-            "Compress the video on the computer's graphics chip (NVIDIA, Intel, AMD or Apple) instead of the processor. That leaves the processor "
-            "free and helps avoid dropped frames; the files can be a little larger. If the chip can't do it, the processor is used anyway. "
-            "Turn this off to always use the processor.")
+            "Read the screen (Windows) and compress the video on the computer's graphics chip (NVIDIA, Intel, AMD or Apple) instead of the "
+            "processor. That leaves the processor free, and helps avoid the dropped frames a busy processor causes; the files can be a little "
+            "larger. If the chip can't do it, the processor is used anyway. Turn this off to always use the processor.")
         form.addRow("Video encoding", self.gpu_checkbox)
         self.clicker_button = QPushButton("Setup BT Clicker")
         self.clicker_button.setToolTip("Use a Bluetooth clicker to pause/resume and to mark while you record.")
@@ -476,7 +478,8 @@ class RecorderMainWindow(QMainWindow):
         mic = self.mic_combo.currentData()
         audio = AudioCaptureConfig(mic.capture_id if isinstance(mic, MicDevice) else None, self.gain_slider.value() / 100.0)
         if isinstance(source, ScreenSource):
-            capture = ScreenCaptureConfig(self._selected_region or source.physical_rect, draw_cursor=not app_settings.get_hide_cursor())
+            capture = ScreenCaptureConfig(self._selected_region or source.physical_rect, draw_cursor=not app_settings.get_hide_cursor(),
+                                          screen_name=source.qt_name, screen_rect=source.physical_rect)
         else:
             plan = self._camera_input(source)
             recorded_size = self._selected_region[2:] if self._selected_region else plan.size
@@ -735,9 +738,12 @@ class RecorderMainWindow(QMainWindow):
             note += f"\n\n{how}"
         source = self._pending_config.source if self._pending_config is not None else None
         if source is not None and not getattr(source, "saves_stream_as_is", False):  # a camera's own stream is only saved, not encoded
-            encoder = describe_encoder(allow_filters=False)
-            if encoder:
-                note += f"\n\nVideo encoded by {encoder}."
+            if self._controller.gpu_fell_back:
+                note += "\n\nVideo encoded by the CPU: the graphics chip could not be started, so this recording used the processor."
+            else:
+                encoder = describe_encoder(allow_filters=False)
+                if encoder:
+                    note += f"\n\nVideo encoded by {encoder}." + (" The screen was read on the graphics chip." if self._controller.captured_on_gpu else "")
         if self._controller.dropped_frame_warnings:
             note += ("\n\nSome frames were dropped: the camera's picture arrived faster than it could be processed. "
                      "A lower camera resolution, or closing other programs, would help.")

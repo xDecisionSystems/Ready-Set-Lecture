@@ -213,7 +213,7 @@ def build_preview_argv(source: CameraCaptureConfig) -> list[str]:
 
 
 class PreviewFeed:
-    """Live preview frames while nothing is being recorded: the 3-2-1 before a start or a resume.
+    """Live preview frames while nothing is being recorded: the 3-2-1 before a start or a resume, and while paused.
 
     The camera can only be open in one process, so this must be stopped (stop() waits until the camera is free)
     before the recorder starts.
@@ -425,8 +425,14 @@ class RecordingController(QObject):
     def state(self) -> str | None:
         return self._state
 
+    @property
+    def previewing(self) -> bool:
+        """True while a preview feed (the camera picture outside a recording segment) is running."""
+        return self._feed is not None
+
     def start_preview_feed(self, source: CameraCaptureConfig) -> None:
-        """Show the live camera picture before recording begins (the countdown). Stop it before start() or resume()."""
+        """Show the live camera picture while nothing is being recorded: the countdowns, and while paused.
+        start() and resume() stop it themselves, so the recorder can have the camera."""
         self.stop_preview_feed()
         if source.preview_size is None:
             return

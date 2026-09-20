@@ -510,10 +510,9 @@ class RecorderMainWindow(QMainWindow):
         self._floating_overlay.set_resuming()
         self._resume_pressed = True
         self._sync_pause_tint()  # the screen goes back to normal for the 3-2-1
-        source = self._camera_source_with_preview()
-        if source is not None and self._camera_preview is not None and self._camera_preview.isVisible():
-            self._camera_preview.set_paused(False)  # live again while it counts down, not a frozen "Paused" picture
-            self._controller.start_preview_feed(source)
+        if self._camera_preview is not None and self._camera_preview.isVisible():
+            self._camera_preview.set_paused(False)  # no "Paused" banner while it counts down
+        self._sync_paused_preview_feed()  # normally already live from the pause; this covers a feed that failed to start
         # No parent: the recorder window is hidden while recording, and a child window would go with it.
         self._resume_countdown = CountdownOverlay()
         self._place_countdown(self._resume_countdown, self.source_combo.currentData())
@@ -608,6 +607,7 @@ class RecorderMainWindow(QMainWindow):
         if self._floating_overlay is not None:
             self._floating_overlay.set_preview_checked(shown)
             self._floating_overlay.raise_()
+        self._sync_paused_preview_feed()  # paused: showing the picture starts the camera, hiding it lets the camera go
 
     def _preview_frame(self, image) -> None:
         if self._camera_preview is not None:
@@ -616,6 +616,19 @@ class RecorderMainWindow(QMainWindow):
     def _preview_state(self, state: str) -> None:
         if self._camera_preview is not None:
             self._camera_preview.set_paused(state == "paused")
+        self._sync_paused_preview_feed()
+
+    def _sync_paused_preview_feed(self) -> None:
+        """The recording releases the camera while paused, which would leave the full-screen picture frozen. Keep it live
+        instead (the red screen is a wash over it), from the pause through the resume 3-2-1. It stops when the recording
+        takes the camera back, and whenever the picture is hidden, so the camera is only open while it is being looked at."""
+        source = self._camera_source_with_preview()
+        live = (source is not None and self._camera_preview is not None and self._camera_preview.isVisible()
+                and self._controller.state == "paused")
+        if not live:
+            self._controller.stop_preview_feed()
+        elif not self._controller.previewing:
+            self._controller.start_preview_feed(source)
 
     def _close_camera_preview(self) -> None:
         self._controller.stop_preview_feed()

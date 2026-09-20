@@ -346,6 +346,10 @@ class RecorderMainWindow(QMainWindow):
         self._paused_tint.hide()
         self._mark_flash.cancel()
         self._clicker.stop()
+        try:
+            self._controller.shutdown()
+        except Exception as exc:  # noqa: BLE001 - shutdown must still let Qt close; session reports its recovery directory
+            QMessageBox.warning(self, "Recording recovery", f"The recording could not be finalized while closing:\n{exc}")
         super().closeEvent(event)
 
     def _mic_changed(self) -> None:
@@ -486,7 +490,7 @@ class RecorderMainWindow(QMainWindow):
             capture = CameraCaptureConfig(source.capture_id, plan.size, self._selected_region, preview_size=preview_frame_size(recorded_size),
                                           input_format=plan.input_format)
         output = unique_path(output_dir / f"{name}.mp4")
-        self._pending_config = RecordConfig(capture, audio, output)
+        self._pending_config = RecordConfig(capture, audio, output, allow_gpu=self.gpu_checkbox.isChecked())
         self._pending_output = output
         self._marker_breaks = []
         if isinstance(mic, MicDevice):
@@ -705,7 +709,7 @@ class RecorderMainWindow(QMainWindow):
             self._start_resume_countdown()
 
     def _mark_break(self) -> None:
-        self._marker_breaks.append(self._controller.elapsed_seconds)  # the button lights up by itself when pressed
+        self._marker_breaks.append(self._controller.mark_time())  # the button lights up by itself when pressed
         if isinstance(getattr(self._pending_config, "source", None), CameraCaptureConfig):
             # Camera recordings only: the screen flashes blue for two seconds. A screen recording never flashes.
             self._mark_flash.flash()

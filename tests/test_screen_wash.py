@@ -237,7 +237,7 @@ class MarkFlashDecisionTests(unittest.TestCase):
         calls: list[str] = []
         fake = SimpleNamespace(
             _marker_breaks=[],
-            _controller=SimpleNamespace(elapsed_seconds=12.5),
+            _controller=SimpleNamespace(elapsed_seconds=12.5, mark_time=lambda: 12.5),
             _pending_config=SimpleNamespace(source=source) if source is not None else None,
             _mark_flash=SimpleNamespace(flash=lambda: calls.append("flash")),
             _floating_overlay=SimpleNamespace(raise_=lambda: calls.append("raise")) if overlay else None,

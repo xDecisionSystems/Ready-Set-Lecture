@@ -1,10 +1,12 @@
 """ffmpeg argv construction and the recorder process lifecycle."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import BinaryIO, Callable
@@ -13,7 +15,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal
 from PySide6.QtGui import QImage
 
 from app.core.ffmpeg_locator import find_ffmpeg
-from app.core.ffmpeg_utils import concat_segments, probe_duration
+from app.core.ffmpeg_utils import concat_segments, probe_duration, probe_has_video
 from app.core.video_encoder import h264_args, is_hardware_encoder
 from app.recorder.core.gpu_capture import plan_gpu_capture
 
@@ -58,6 +60,7 @@ class RecordConfig:
     source: ScreenCaptureConfig | CameraCaptureConfig
     audio: AudioCaptureConfig
     output_path: Path
+    allow_gpu: bool = True
 
 
 VIDEO_TIMESCALE = 90000
@@ -272,7 +275,9 @@ class RecordingSession:
         self._log: BinaryIO | None = None
         self._finishing: list[tuple[subprocess.Popen[bytes], BinaryIO | None]] = []  # stopped segments still closing their files
         self.dropped_frame_warnings = 0  # set by finalize(): how often ffmpeg said the camera stream was backing up
-        self._allow_gpu = True  # false once a start-up failure has sent this recording to the CPU
+        self._allow_gpu = config.allow_gpu  # false when disabled by the user, or after an automatic CPU fallback
+        self._forced_stop = False
+        self._bad_exit_codes: list[int] = []
         self.segment_used_gpu = False  # the newest segment captures or encodes on the graphics chip
         self.captured_on_gpu = False  # ... and it captures the screen there
         self.fell_back_to_cpu = False
@@ -306,13 +311,21 @@ class RecordingSession:
         path = self.work_dir / f"segment_{len(self.segment_paths) + 1:03d}.mp4"
         # stderr goes to a file, not a PIPE nobody reads: once the pipe buffer fills, ffmpeg blocks on its
         # next log write, never sees the 'q' stop, and gets terminated, leaving an MP4 with no moov atom.
-        self._log = open(path.with_suffix(".log"), "wb")
-        preview = self.config.source.preview_size if isinstance(self.config.source, CameraCaptureConfig) else None
-        argv = build_ffmpeg_argv(self.config, path, allow_gpu=self._allow_gpu)
-        self.segment_used_gpu = uses_graphics_chip(argv)
-        self.captured_on_gpu = any(part.startswith("ddagrab=") for part in argv)
-        self._segment_started = time.monotonic()
-        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE if preview else subprocess.DEVNULL, stderr=self._log)
+        log = open(path.with_suffix(".log"), "wb")
+        try:
+            preview = self.config.source.preview_size if isinstance(self.config.source, CameraCaptureConfig) else None
+            argv = build_ffmpeg_argv(self.config, path, allow_gpu=self._allow_gpu)
+            self.segment_used_gpu = uses_graphics_chip(argv)
+            self.captured_on_gpu = any(part.startswith("ddagrab=") for part in argv)
+            self._segment_started = time.monotonic()
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE if preview else subprocess.DEVNULL, stderr=log)
+        except Exception:
+            log.close()
+            path.with_suffix(".log").unlink(missing_ok=True)
+            self._remove_empty_work_dir()
+            raise
+        self._log = log
+        self.proc = proc
         if preview:
             threading.Thread(target=_drain_frames, args=(self.proc.stdout, preview[0] * preview[1] * 4, self._on_preview_frame), daemon=True).start()
         self.segment_paths.append(path)
@@ -339,10 +352,12 @@ class RecordingSession:
             pass  # already exiting
 
     @staticmethod
-    def _reap(proc: subprocess.Popen[bytes], log: BinaryIO | None, timeout: float) -> None:
+    def _reap(proc: subprocess.Popen[bytes], log: BinaryIO | None, timeout: float) -> bool:
+        forced = False
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            forced = True
             proc.terminate()
             try:
                 proc.wait(timeout=2)
@@ -352,18 +367,23 @@ class RecordingSession:
         finally:
             if log:
                 log.close()
+        return forced
 
     def _reap_finishing(self, timeout: float) -> None:
         finishing, self._finishing = self._finishing, []
         for proc, log in finishing:
-            self._reap(proc, log, timeout)
+            self._forced_stop |= self._reap(proc, log, timeout)
+            if proc.returncode not in (None, 0):
+                self._bad_exit_codes.append(proc.returncode)
 
     def stop_segment_blocking(self, timeout: float = 5.0) -> None:
         proc, self.proc = self.proc, None
         log, self._log = self._log, None
         if proc is not None:
             self._request_stop(proc)
-            self._reap(proc, log, timeout)
+            self._forced_stop |= self._reap(proc, log, timeout)
+            if proc.returncode not in (None, 0):
+                self._bad_exit_codes.append(proc.returncode)
         self._reap_finishing(timeout)
 
     def poll_alive(self) -> bool:
@@ -395,24 +415,52 @@ class RecordingSession:
     def finalize(self, output_path: Path) -> Path:
         self._reap_finishing(5.0)
         completed = [path for path in self.segment_paths if path.exists() and path.stat().st_size > 0]
-        if len(completed) > 1:
-            # A segment stopped a moment after it began (e.g. the cursor option toggled right at the start) can be
-            # an empty file that would break the join, so keep only segments that hold some video.
-            completed = [path for path in completed if self._has_video(path)]
+        # A killed MP4 can be non-empty but lack a readable movie header, including in the one-segment case.
+        completed = [path for path in completed if self._has_video(path)]
         if not completed:
-            raise RuntimeError("ffmpeg did not produce a recording segment.")
+            raise RuntimeError(f"ffmpeg did not produce a usable recording segment. Recovery files are in {self.work_dir}")
+        if self._forced_stop:
+            raise RuntimeError(f"ffmpeg had to be terminated. Recovery files are in {self.work_dir}")
+        if self._bad_exit_codes:
+            codes = ", ".join(str(code) for code in self._bad_exit_codes)
+            raise RuntimeError(f"ffmpeg exited with an error ({codes}). Recovery files are in {self.work_dir}")
         self.dropped_frame_warnings = sum(self._count_drop_warnings(path.with_suffix(".log")) for path in self.segment_paths)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        if len(completed) == 1:
-            shutil.move(str(completed[0]), output_path)
-        else:
-            concat_segments(completed, output_path)
-            for path in completed:
-                path.unlink(missing_ok=True)
+        publish_path = output_path.with_name(f".{output_path.stem}.{uuid.uuid4().hex}.partial{output_path.suffix}")
+        try:
+            if len(completed) == 1:
+                shutil.copy2(completed[0], publish_path)
+            else:
+                concat_segments(completed, publish_path)
+            if not self._has_video(publish_path):
+                raise RuntimeError(f"The assembled recording failed validation. Recovery files are in {self.work_dir}")
+            try:
+                # Atomic create-if-absent: never overwrite a name that appeared while recording.
+                os.link(publish_path, output_path)
+            except FileExistsError as exc:
+                raise RuntimeError(f"A file now exists at {output_path}. Recovery files are in {self.work_dir}") from exc
+        finally:
+            publish_path.unlink(missing_ok=True)
         for path in self.segment_paths:
             path.unlink(missing_ok=True)
             path.with_suffix(".log").unlink(missing_ok=True)
+        self._remove_empty_work_dir()
         return output_path
+
+    def abort(self, preserve_files: bool = True, timeout: float = 5.0) -> None:
+        """Idempotently stop every process and close every log owned by the session."""
+        self.stop_segment_blocking(timeout)
+        if not preserve_files:
+            for path in self.segment_paths:
+                path.unlink(missing_ok=True)
+                path.with_suffix(".log").unlink(missing_ok=True)
+            self._remove_empty_work_dir()
+
+    def _remove_empty_work_dir(self) -> None:
+        try:
+            self.work_dir.rmdir()
+        except OSError:
+            pass
 
     @staticmethod
     def _count_drop_warnings(log: Path) -> int:
@@ -426,7 +474,7 @@ class RecordingSession:
     @staticmethod
     def _has_video(path: Path) -> bool:
         try:
-            return probe_duration(path) > 0.05
+            return probe_has_video(path) and probe_duration(path) > 0.05
         except Exception:  # noqa: BLE001 - an unreadable segment is simply left out
             return False
 
@@ -439,6 +487,8 @@ class PauseStopWorker(QThread):
     def __init__(self, session: RecordingSession, output_path: Path | None, parent=None) -> None:
         super().__init__(parent)
         self.session, self.output_path = session, output_path
+        self.result_path: Path | None = None
+        self.error_message: str | None = None
 
     def run(self) -> None:
         try:
@@ -446,9 +496,11 @@ class PauseStopWorker(QThread):
             if self.output_path is None:
                 self.done.emit()
             else:
-                self.finalized.emit(self.session.finalize(self.output_path))
+                self.result_path = self.session.finalize(self.output_path)
+                self.finalized.emit(self.result_path)
         except Exception as exc:  # noqa: BLE001
-            self.error.emit(str(exc))
+            self.error_message = str(exc)
+            self.error.emit(self.error_message)
 
 
 class RecordingController(QObject):
@@ -512,6 +564,9 @@ class RecordingController(QObject):
             self.session = RecordingSession(config, work_dir, self._emit_preview)
             self.session.start_segment()
         except Exception as exc:  # noqa: BLE001
+            if self.session is not None:
+                self.session.abort(preserve_files=False)
+                self.session = None
             self.failed.emit(str(exc))
             return
         self._final_output = final_output
@@ -526,6 +581,7 @@ class RecordingController(QObject):
     def pause(self) -> None:
         if self._state != "recording" or not self.session or self._worker:
             return
+        self._accumulate_elapsed()
         self._timer.stop()
         self._start_worker(None)
 
@@ -536,7 +592,7 @@ class RecordingController(QObject):
         try:
             self.session.start_segment()
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
+            self._fail(exc)
             return
         self._last_tick = time.monotonic()
         self._timer.start()
@@ -564,6 +620,8 @@ class RecordingController(QObject):
     def stop(self) -> None:
         if self._worker or not self.session:
             return
+        if self._state == "recording":
+            self._accumulate_elapsed()
         self._timer.stop()
         if self._state == "paused":
             try:
@@ -594,8 +652,19 @@ class RecordingController(QObject):
         self.finished.emit(output)
 
     def _fail(self, exc: Exception | str) -> None:
+        session = self.session
+        recovery = ""
+        if session is not None:
+            try:
+                session.abort(preserve_files=True)
+                if session.work_dir.exists() and any(session.work_dir.iterdir()):
+                    recovery = f"\n\nRecovery files are in {session.work_dir}"
+                else:
+                    session._remove_empty_work_dir()
+            except Exception as cleanup_exc:  # noqa: BLE001
+                recovery = f"\n\nCleanup also failed: {cleanup_exc}"
         self._reset()
-        self.failed.emit(str(exc))
+        self.failed.emit(str(exc) + recovery)
 
     def _worker_finished(self) -> None:
         if self._worker:
@@ -623,7 +692,43 @@ class RecordingController(QObject):
             tail = self.session.log_tail()
             self._fail("ffmpeg stopped unexpectedly." + (f"\n\n{tail}" if tail else ""))
             return
+        self._accumulate_elapsed()
+
+    def _accumulate_elapsed(self) -> None:
+        if self._state != "recording":
+            return
         now = time.monotonic()
-        self.elapsed_seconds += now - self._last_tick
+        self.elapsed_seconds += max(0.0, now - self._last_tick)
         self._last_tick = now
         self.elapsed_changed.emit(self.elapsed_seconds)
+
+    def mark_time(self) -> float:
+        """Return an up-to-date timestamp for a marker, independent of the UI timer cadence."""
+        self._accumulate_elapsed()
+        return self.elapsed_seconds
+
+    def shutdown(self) -> Path | None:
+        """Stop and save synchronously on application exit; preserve recovery files on failure."""
+        self._timer.stop()
+        self.stop_preview_feed()
+        worker = self._worker
+        if worker is not None:
+            if not worker.wait(8000):
+                raise RuntimeError("The recording worker did not finish during shutdown; recovery files were preserved.")
+            if worker.error_message is not None:
+                raise RuntimeError(worker.error_message)
+            if worker.result_path is not None:
+                self._reset()
+                return worker.result_path
+        session = self.session
+        output = getattr(self, "_final_output", None)
+        if session is None:
+            return None
+        try:
+            session.stop_segment_blocking()
+            if output is not None:
+                return session.finalize(output)
+            session.abort(preserve_files=True)
+            return None
+        finally:
+            self._reset()

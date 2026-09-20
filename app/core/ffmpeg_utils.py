@@ -56,3 +56,14 @@ def probe_duration(path: Path) -> float:
         return float(result.stdout.decode().strip())
     except ValueError as exc:
         raise FfmpegRunError(f"ffprobe returned no usable duration for {path}") from exc
+
+
+def probe_has_video(path: Path) -> bool:
+    """Return whether ffprobe can find at least one video stream in *path*."""
+    result = subprocess.run(
+        [find_ffprobe(), "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise FfmpegRunError(result.stderr.decode(errors="replace")[-2000:] or "ffprobe failed")
+    return bool(result.stdout.decode(errors="replace").strip())

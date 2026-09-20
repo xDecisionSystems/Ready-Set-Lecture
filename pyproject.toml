@@ -1,0 +1,23 @@
+[project]
+name = "readysetlecture"
+version = "0.1.0"
+description = "Cross-platform trim/cut/split editor for single-take lecture videos, with colored-marker-assisted cut point detection."
+license = {text = "GPL-3.0-or-later"}
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6",
+    "python-mpv>=1.0.5",
+    "opencv-python>=4.9",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.3",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]

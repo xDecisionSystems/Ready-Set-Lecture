@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local Claude Code settings
+.claude/
+
+# Large binaries kept out of git (see packaging/vendor/win-64/README.md)
+packaging/vendor/win-64/libmpv-2.dll
+downloads/
+
+# Debug output
+tests/_debug_out.raw
